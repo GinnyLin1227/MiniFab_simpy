@@ -15,6 +15,7 @@ import argparse
 import json
 from pathlib import Path
 from datetime import datetime
+import wandb
 
 # 假設已安裝必要的包
 # pip install ray gymnasium pettingzoo numpy pandas
@@ -66,7 +67,7 @@ class IntegratedTrainer:
         # 初始化ES訓練器
         print("[Trainer] Initializing Evolution Strategies...")
         self.es_trainer = EvolutionStrategies(
-            input_dim=12,  # 特徵維度
+            input_dim=16,  # 特徵維度
             hidden_dim=64,
             output_dim=4,  # 4種派工策略
             population_size=population_size,
@@ -186,17 +187,59 @@ class IntegratedTrainer:
     
     def _evaluate_policy(self, policy_network: PolicyNetwork) -> float:
         """
-        評估單個策略
-        
-        與同儕比較（相對評估）
+        真正運行環境來評估策略 (取消隨機數)
         """
-        # 簡化實現：返回隨機適應度
-        # 實際應運行環境並計算獎勵
-        return float(np.random.randn() * 10 + 50)
+        # 1. 建立一個獨立的測試環境
+        env = MultiAgentMiniFabEnv(**self.env_config)
+        obs, _ = env.reset()
+        done = False
+        
+        # 2. 讓這個神經網路控制產線直到結束或超時
+        while not done:
+            # 將狀態轉換為神經網路輸入
+            actions = {}
+            for agent, agent_obs in obs.items():
+                probs = policy_network.forward(agent_obs.reshape(1, -1))
+                actions[agent] = int(np.argmax(probs[0]))
+                
+            obs, _, terminations, truncations, _ = env.step(actions)
+            done = any(terminations.values()) or any(truncations.values())
+            
+        # 3. 取得最終完工時間 (Makespan)
+        report = env.get_report()
+        # ==========================================
+        # 4. 提取四大 KPI 指標並計算綜合 Score (Reward)
+        # ==========================================
+        
+        # (1) 最大化產出 (Outs): 完成的批次數量
+        outs = report.get("finished_lots", 0)
+        
+        # (2) 最小化生產週期 (TPT): 平均花費時間
+        avg_tpt = report.get("avg_tpt_min", 20000.0)
+        
+        # (3) 最小化在製品 (WIP): 提取 wip_log 中的平均值
+        wip_df = report.get("wip_log")
+        if wip_df is not None and not wip_df.empty:
+            mean_wip = wip_df["wip"].mean()
+        else:
+            mean_wip = 84.0 # 若沒有紀錄，給予最差的預設值
+            
+        # (4) 最大化使用率 (Utilization): 計算所有機台的平均使用率 (0.0 ~ 1.0)
+        util_dict = report.get("machine_util", {})
+        if util_dict:
+            mean_util = sum(util_dict.values()) / len(util_dict)
+        else:
+            mean_util = 0.0
+            
+        # 綜合計分公式 (您可以依據論文的需求調整這些權重數字)
+        # 正向指標用加的 (+)，負向指標用減的 (-)
+        score = (outs * 100) - (avg_tpt * 2) - (mean_wip * 5) + (mean_util * 1000)
+        
+        return float(score)
     
     def _create_policy_fn(self, individual) -> callable:
         """根據個體創建策略函數"""
-        network = PolicyNetwork(12, 64, 4)
+        network = PolicyNetwork(16, 64, 4)
         network.set_weights(individual.weights)
         
         def policy_fn(agent, obs):
@@ -211,6 +254,7 @@ class IntegratedTrainer:
         num_generations: int = 10,
         episodes_per_gen: int = 3,
         checkpoint_interval: int = 5,
+        use_wandb: bool = True # 新增 WandB 開關
     ):
         """
         完整訓練流程
@@ -227,12 +271,35 @@ class IntegratedTrainer:
         print(f"  Ray actors: {self.ray_info['num_cpus']}")
         print(f"  ES population size: {self.es_trainer.population_size}")
         print(f"{'='*60}")
-        
+        if use_wandb:
+            wandb.init(
+                project="minifab_es_training",
+                name=f"ray_es_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                config={
+                    "total_generations": num_generations,
+                    "episodes_per_gen": episodes_per_gen,
+                    "population_size": self.es_trainer.population_size,
+                    "elite_size": self.es_trainer.elite_size,
+                    "mutation_std": self.es_trainer.mutation_std,
+                    "ray_actors": self.ray_info['num_cpus'],
+                }
+            )
         try:
             for gen in range(num_generations):
                 # 訓練一代
                 gen_stats = self.train_generation(episodes_per_gen)
-                
+                if use_wandb:
+                    wandb.log({
+                        "generation": gen_stats["generation"],
+                        
+                        "es/best_fitness": gen_stats["es_eval"]["best_fitness"],
+                        "es/mean_fitness": gen_stats["es_eval"]["mean_fitness"],
+                        "es/worst_fitness": gen_stats["es_eval"]["worst_fitness"],
+                        
+                        "rollout/mean_reward": gen_stats["ray_rollout"]["mean_reward"],
+                        "rollout/mean_makespan": gen_stats["ray_rollout"]["mean_makespan"],
+                        "rollout/mean_setup": gen_stats["ray_rollout"]["mean_setup"]
+                    }, step=gen_stats["generation"])
                 # 保存檢查點
                 if (gen + 1) % checkpoint_interval == 0:
                     self.save_checkpoint(f"gen_{gen}_checkpoint.json")
@@ -240,7 +307,11 @@ class IntegratedTrainer:
             
             # 最終統計
             self.print_summary()
-            
+            if use_wandb:
+                best_ind = self.es_trainer.get_best_policy()
+                wandb.summary["best_individual_id"] = best_ind.individual_id
+                wandb.summary["best_fitness_final"] = best_ind.fitness
+                wandb.summary["wins"] = best_ind.wins
         except KeyboardInterrupt:
             print("\n[Training] Interrupted by user")
         
@@ -344,7 +415,8 @@ def main():
         "--output-dir", type=str, default="./training_results",
         help="Output directory for results"
     )
-    
+    # 🟢 [WANDB 新增] 命令列開關
+    parser.add_argument("--no-wandb", action="store_true", help="Disable WandB logging")
     args = parser.parse_args()
     
     # 建立訓練器
@@ -360,6 +432,7 @@ def main():
         num_generations=args.generations,
         episodes_per_gen=args.episodes_per_gen,
         checkpoint_interval=5,
+        use_wandb=not args.no_wandb
     )
 
 
